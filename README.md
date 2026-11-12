@@ -8,6 +8,10 @@ Bitcoin's price is split into 15-minute blocks that start at :00, :15, :30 and :
 
 It shows the answer as a percentage (for example, "72% UP") in the terminal and on a live chart at `http://localhost:8000`.
 
+**The start price matches Robinhood.** Each block starts at the target price of Robinhood's 15-minute BTC up/down contract (Kalshi's `KXBTC15M` market), fetched when the block opens. That target is the average of an index (CF Benchmarks' BRTI) over the 60 seconds before the block, so it is usually a few dollars away from Coinbase's price at the bell, and sometimes much more. Coinbase's price is shifted by the gap so the lead is measured on the same footing, and each block is scored with the contract's own result. `--start exchange` goes back to Coinbase's opening price. History used for self-tuning still comes from Coinbase's 1-minute candles, which is a close stand-in, not an exact match.
+
+The chart page shows no call, percentage or projected range for the first 5 minutes of a block, because too much can still change that early. The readings are still worked out and saved.
+
 > This is a statistics project, not financial advice.
 
 ---
@@ -150,3 +154,57 @@ It tests extra clues on top of the live model, including time-of-day patterns, v
 2. **Live, side by side** with the real predictor, scored as each block ends. This is the real test: an idea can look good on history by luck, but live data can't be fooled.
 
 It also records Polymarket and Kalshi odds so you can see how the predictor compares to the betting market. An idea that wins in the lab still has to be added to `btc_15.py` and pass its self-test before it affects real calls.
+
+---
+
+## The traffic light (`btc_light.py`)
+
+A third script, with its own database (`btc_light.db`) and its own page, that answers a different question from the percentage: **how much should the current call be trusted right now?**
+
+```bash
+python btc_light.py    # page at http://localhost:8002/testing-2 (also reachable at :8000/testing-2)
+```
+
+It needs `btc_15.py` running, and shows the testing lab's call beside it when `btc_lab.py` is running too. It only reads from them; it never changes a call.
+
+**The light also shows on the main page**, in the Confidence card, while this script is running (it says "Off" when it is not). While `btc_lab.py` is running, the main page's projection is the lab's test model (the main model plus the signals that passed the backtest); otherwise it is the main model. Either way, the readings `btc_15.py` saves and scores are still its own model's, so the lab and the light keep comparing against an unchanged baseline.
+
+The row of buttons under the main page's header switches each part of the page, and each layer of the chart, on or off. The choice is remembered in that browser.
+
+| Light | Meaning |
+|---|---|
+| **Red** | The feed is down or stale, the exchanges disagree, the chance the call holds is under the red line, or a proven "stop" warning is on |
+| **Green** | The chance the call holds has stayed over the green line for a minute, and no proven warning is on |
+| **Yellow** | Everything else |
+
+For the first 5 minutes of each block there is no light, call or projection on this page, because too much can still change. Those minutes are recorded but never scored.
+
+### The chart
+
+The page's chart is the main page's chart (price, start price, likely range, example paths) drawn over the order book: green and red bands show buy and sell orders resting at each price, brighter meaning more BTC. Every part can be switched on and off with the buttons under it.
+
+It also draws an experimental **range bent by the orders**: the main page's likely range, pulled in where resting orders are thick and let out where they are thin, with a matching order-adjusted call. Resting orders can be pulled before the price reaches them, so this is scored live against the main page before anything relies on it.
+
+### What it records
+
+Every 10 seconds it saves a summary of Coinbase's full order book: how much BTC is resting within $10 to $1,000 of the price on each side, the five largest single orders per side, and any of those that shrank by half since the last look. Past order books can't be downloaded, so this history only grows from the day the script starts.
+
+### The warning flags
+
+| Flag | What it looks for |
+|---|---|
+| Choppy | The price has crossed the start several times this block |
+| Wild market | Recent swings are well above the usual |
+| Thin book | Little is resting between the price and the start, compared with how much is trading |
+| Large order ahead | An unusually large order sits close by, between the price and the start |
+| Large order pulled | A large order protecting the lead vanished without being traded |
+| Large order eaten | A large order protecting the lead is being traded away |
+| Sweep against the lead | A burst of market orders against the lead |
+
+### How it gets better
+
+- **The green and red lines are fitted, not fixed.** Every few hours they are refitted on history and checked on recent days the fit never saw.
+- **Flags have to earn their place.** Every flag is logged from day one but only "watched". It starts to change the colour once the record shows calls made while it was on were clearly worse than their percentages claimed, and it stops again if the record stops showing that.
+- **Order-book signals join after 14 days.** Once enough book history exists, the signals are fitted on top of the live model and used for the light only if they beat it on unseen readings.
+- **Every reading is scored.** The page shows how often green, yellow and red were actually right, beside the main page's and the testing page's calls on the same moments.
+

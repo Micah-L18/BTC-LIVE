@@ -94,6 +94,8 @@ BASE = {"id": 0, "window": 120, "k": [1.0, 1.0, 1.0]}   # the original, untuned 
 HOLDOUT = 0.2                      # most recent share of history kept back for testing
 MARGIN = 0.0005                    # log-loss improvement a candidate needs to be adopted
 MAX_TRAIN_DAYS = 90
+LIGHT_PORT = 8002                  # where btc_light.py serves its /testing-2 page (passed through at /testing-2)
+LAB_PORT = 8001                    # where btc_lab.py serves its /testing page (passed through at /testing)
 
 
 def utc(ts, fmt="%H:%M"):
@@ -223,6 +225,34 @@ def market_odds(session, market, start, cache):
         if abs(closes - (start + BAR)) < 60:
             return float(m["yes_bid_dollars"]), float(m["yes_ask_dollars"])
     raise LookupError("no open market for this interval")
+
+
+KALSHI = "https://api.elections.kalshi.com/trade-api/v2/markets"
+
+
+def contract(session, start):
+    """Robinhood's 15-minute BTC up/down contract for the interval starting at `start` (it is
+    Kalshi's KXBTC15M market): (ticker, target price), or None until the target is posted.
+    The target is the average of CF Benchmarks' BRTI index over the 60 seconds before the
+    interval starts, and the contract pays Up if the same average over the interval's last
+    60 seconds is at least that."""
+    r = session.get(KALSHI, params={"series_ticker": "KXBTC15M", "status": "open"}, timeout=3)
+    r.raise_for_status()
+    for m in r.json()["markets"]:
+        closes = datetime.fromisoformat(m["close_time"].replace("Z", "+00:00")).timestamp()
+        if abs(closes - (start + BAR)) < 60 and m.get("floor_strike"):
+            return m["ticker"], float(m["floor_strike"])
+    return None
+
+
+def contract_result(session, ticker):
+    """(settled Up?, final price) once the contract has settled, else None."""
+    r = session.get(f"{KALSHI}/{ticker}", timeout=3)
+    r.raise_for_status()
+    m = r.json()["market"]
+    if m.get("result") not in ("yes", "no"):
+        return None
+    return m["result"] == "yes", float(m["expiration_value"]) if m.get("expiration_value") else None
 
 
 # ---------------------------------------------------------------- model
@@ -816,6 +846,16 @@ def live(feed, args, db, candles, model, last_check):
     fine_at = 0
     last_err = None
     last_ok = db.execute("SELECT MAX(t) FROM readings").fetchone()[0]   # so downtime shows up as a gap
+    # Matching Robinhood's contract: the start price is the contract's target price, and the
+    # exchange's price is shifted by `basis` so it tracks the index the contract settles on.
+    by_contract = args.start == "contract" and not args.start_price
+    basis = 0.0          # dollars added to every exchange price this interval
+    source = None        # where start_price came from: "contract", "estimate" (ours, of the target) or None
+    ticker = None        # the contract for the interval being tracked
+    pre_raw = None       # the exchange's own average over the 60 s before this interval
+    tail = []            # (time, unshifted price) for the last 90 s
+    tgt_at = res_at = 0
+    pending = {}         # finished intervals waiting for the contract's official result: start -> [ticker, our call, give up at]
 
     def start_training():
         """Tune a candidate in the background; the loop adopts it (or not) when it finishes."""
@@ -854,13 +894,20 @@ def live(feed, args, db, candles, model, last_check):
             if start != cur:
                 if cur is not None and price is not None and start_price is not None:
                     if last_ok and cur + BAR - last_ok <= 15:    # we saw the price right up to the end
+                        end_price, res = price, outcome(start_price, price)
+                        if by_contract:                          # the contract settles on the last 60 seconds' average
+                            last60 = [p for t, p in ticks if t >= cur + BAR - 60]
+                            end_price = sum(last60) / len(last60) if last60 else price
+                            res = "UP" if end_price >= start_price else "DOWN"
                         print(("" if args.log else "\n") +
-                              f"== {utc(cur)}-{utc(cur + BAR)} finished {outcome(start_price, price)}: "
-                              f"start {start_price:,.2f}, end {price:,.2f} "
-                              f"({price / start_price - 1:+.3%})\n")
-                        results = (results + [{"start": cur, "result": outcome(start_price, price)}])[-12:]
-                        db.execute("UPDATE readings SET up=? WHERE start=?", (int(price > start_price), cur))
+                              f"== {utc(cur)}-{utc(cur + BAR)} finished {res}: "
+                              f"start {start_price:,.2f}, end {end_price:,.2f} "
+                              f"({end_price / start_price - 1:+.3%})\n")
+                        results = (results + [{"start": cur, "result": res}])[-12:]
+                        db.execute("UPDATE readings SET up=? WHERE start=?", (int(res == "UP"), cur))
                         db.commit()
+                    if ticker:                                   # the contract's own result replaces ours when it posts
+                        pending[cur] = [ticker, tick + 1800]
                     backfill_outcomes(db, candles)               # intervals that ended during an outage
                     if SNAP["learn"]:
                         publish(learn={**SNAP["learn"], "live": live_stats(db)})
@@ -868,13 +915,55 @@ def live(feed, args, db, candles, model, last_check):
                         start_training()
                 filled = cur is not None     # watched from the first second: nothing to backfill
                 cur, start_price, exact, ticks, marks = start, None, False, [], []
+                ticker, source, tgt_at, pre = None, None, 0, [p for t, p in tail if start - 60 <= t < start]
+                pre_raw = sum(pre) / len(pre) if len(pre) >= 20 else None
+                if by_contract and pre_raw is not None:          # our own estimate of the target, until it is posted
+                    start_price, source = pre_raw + basis, "estimate"
                 if override:
                     start_price, exact, override = override, True, None
+
+            if by_contract and not exact and tick - tgt_at >= 3:
+                tgt_at = tick
+                try:
+                    got = contract(feed.s, cur)
+                except (requests.RequestException, KeyError, ValueError):
+                    got, tgt_at = None, tick + 7                 # the contract's site is having trouble: ask less often
+                if got:
+                    ticker, target = got
+                    new = target - pre_raw if pre_raw is not None else basis
+                    if abs(new) > 0.003 * target:                # an implausible gap: keep the last one
+                        new = basis
+                    ticks = [(t, p + new - basis) for t, p in ticks]
+                    marks = [m + new - basis for m in marks]
+                    price = price + new - basis if price is not None else None
+                    basis, start_price, exact, source = new, target, True, "contract"
+                elif tick - cur > 120 and source == "estimate":  # no target posted: go on with our estimate of it
+                    exact = True
+            if pending and tick - res_at >= 15:
+                res_at = tick
+                for st, (tk, until) in list(pending.items()):
+                    try:
+                        got = contract_result(feed.s, tk)
+                    except (requests.RequestException, KeyError, ValueError):
+                        got = None
+                    if got:
+                        res = "UP" if got[0] else "DOWN"
+                        db.execute("UPDATE readings SET up=? WHERE start=?", (int(got[0]), st))
+                        db.commit()
+                        for r in results:
+                            if r["start"] == st:
+                                if r["result"] != res:
+                                    print(("" if args.log else "\n") + f"== {utc(st)}-{utc(st + BAR)} settled {res} on the "
+                                          f"contract (final {got[1]:,.2f}); our own reading said {r['result']}.\n")
+                                r["result"] = res
+                        del pending[st]
+                    elif tick > until:
+                        del pending[st]
 
             # Once a minute: fetch the newest 1-minute candles, save them, and
             # re-measure volatility. Also look up the interval's true opening
             # price until the exchange has published it.
-            if tick - sig_at > 60 or not exact:
+            if tick - sig_at > 60 or (not exact and not by_contract):
                 since = int(tick) - 290 * 60
                 if candles:
                     since = max(since, max(candles) - 180)
@@ -892,7 +981,7 @@ def live(feed, args, db, candles, model, last_check):
                         break
                     earlier.append(candles[T + 840][1] > candles[T][0])
                 sig_at = tick
-                if not exact and cur in candles:
+                if not exact and not by_contract and cur in candles:
                     start_price, exact = candles[cur][0], True
                 if not seeded:               # how the last few intervals ended
                     results = [{"start": T, "result": outcome(candles[T][0], candles[T + 840][1])}
@@ -900,13 +989,15 @@ def live(feed, args, db, candles, model, last_check):
                                if T in candles and T + 840 in candles]
                     seeded = True
                 if not filled and cur in candles:   # started mid-interval: draw the part we missed
-                    ticks = ([(cur, candles[cur][0])] +
-                             [(t + 60, candles[t][1]) for t in range(cur, int(tick), 60)
+                    ticks = ([(cur, candles[cur][0] + basis)] +
+                             [(t + 60, candles[t][1] + basis) for t in range(cur, int(tick), 60)
                               if t in candles and t + 60 <= tick] + ticks)
-                    marks = [candles[t][1] for t in range(cur, int(tick), 60) if t in candles and t + 60 <= tick]
+                    marks = [candles[t][1] + basis for t in range(cur, int(tick), 60) if t in candles and t + 60 <= tick]
                     filled = True
 
-            prev, price = price, feed.price()
+            raw = feed.price()
+            tail = [x for x in tail if x[0] > tick - 90] + [(tick, raw)]
+            prev, price = price, raw + basis
             if start_price is None:
                 start_price = price          # stand-in until the real open arrives
             if sig is None:
@@ -957,7 +1048,7 @@ def live(feed, args, db, candles, model, last_check):
             publish(now=tick, start=cur, end=cur + BAR, start_price=start_price, exact=exact,
                     price=price, sigma=sg, k=model["k"], k_now=k_now, tilt=tilt, p_up=p,
                     swing=(sig_fast / sig) if sig_fast and sig else None, ticks=list(ticks),
-                    results=results, error=None)
+                    results=results, error=None, basis=basis, start_source=source)
             call = f"UP {p:.0%}" if p >= 0.5 else f"DOWN {1 - p:.0%}"
             line = (f"{utc(tick, '%H:%M:%S')}  {utc(cur)}-{utc(cur + BAR)}  "
                     f"start {'' if exact else '~'}{start_price:,.2f}  "
@@ -980,11 +1071,35 @@ def live(feed, args, db, candles, model, last_check):
 # ------------------------------------------------------------ chart page
 
 class Handler(BaseHTTPRequestHandler):
+    def lab(self, method):
+        """Pass /testing through to the side-testing lab (btc_lab.py) on its own port, so the
+        lab works on the same address as this page (e.g. through a tunnel to this port).
+        /testing-2 goes straight to the traffic light (btc_light.py), so the light on this
+        page works whether or not the lab is running."""
+        light = self.path.startswith("/testing-2")
+        port = LIGHT_PORT if light else LAB_PORT
+        try:
+            r = requests.request(method, f"http://127.0.0.1:{port}{self.path}", timeout=10,
+                                 allow_redirects=False)
+            body, code, ctype = r.content, r.status_code, r.headers.get("Content-Type", "text/plain")
+        except requests.RequestException:
+            body = b"The traffic light (btc_light.py) is not running." if light else b"The testing lab (btc_lab.py) is not running."
+            code, ctype = 502, "text/plain; charset=utf-8"
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if self.path.startswith("/data"):
             body, ctype = json.dumps(SNAP).encode(), "application/json"
         elif self.path in ("/", "/index.html"):
             body, ctype = PAGE.encode(), "text/html; charset=utf-8"
+        elif self.path.startswith("/testing"):
+            self.lab("GET")
+            return
         else:
             self.send_error(404)
             return
@@ -996,6 +1111,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        if self.path.startswith("/testing"):
+            self.lab("POST")
+            return
         if self.path != "/retrain":
             self.send_error(404)
             return
@@ -1028,6 +1146,9 @@ def main():
     ap.add_argument("--source", choices=["coinbase", "binance", "binanceus"], default="coinbase")
     ap.add_argument("--every", type=float, default=2.0, help="seconds between readings (default 2)")
     ap.add_argument("--start-price", type=float, help="override the start price of the interval in progress")
+    ap.add_argument("--start", choices=["contract", "exchange"], default="contract",
+                    help="contract (default): start each interval at the target price of Robinhood's 15-minute BTC "
+                         "contract and score it the way the contract settles; exchange: the exchange's own opening price")
     ap.add_argument("--log", action="store_true", help="print each reading on its own line")
     ap.add_argument("--history-days", type=int, default=30,
                     help="days of history to keep and tune on (default 30); raise it later to download older data")
@@ -1092,7 +1213,7 @@ PAGE = r"""<!doctype html>
   :root {
     --bg: #090a0c; --card: #101216; --line: #1e2229; --grid: #16191e;
     --text: #eef0f3; --muted: #868d9a; --faint: #565c67;
-    --up: #2ebd85; --down: #f6465d; --heat: 76,141,255;
+    --up: #2ebd85; --down: #f6465d; --warn: #e8b84a; --heat: 76,141,255;
     --mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
     --sans: "Archivo", "Helvetica Neue", Arial, sans-serif;
   }
@@ -1127,8 +1248,8 @@ PAGE = r"""<!doctype html>
   .up { color: var(--up); } .down { color: var(--down); }
 
   /* 1. the answer: projection, confidence, conditions */
-  .hero { display: grid; gap: 16px; grid-template-columns: minmax(250px, 1fr) minmax(280px, 1.25fr) minmax(280px, 1.1fr); }
-  @media (max-width: 980px) { .hero { grid-template-columns: 1fr; } }
+  .hero { display: grid; gap: 16px; grid-auto-flow: column; grid-auto-columns: minmax(250px, 1fr); }
+  @media (max-width: 980px) { .hero { grid-auto-flow: row; grid-auto-columns: auto; } }
   .dir { font-size: 13px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
   .big { font-family: var(--mono); font-weight: 700; font-size: 68px; line-height: 1; letter-spacing: -.04em; margin: 6px 0 2px; }
   .big sup { font-size: 28px; font-weight: 500; vertical-align: top; position: relative; top: 7px; margin-left: 2px; letter-spacing: 0; }
@@ -1142,6 +1263,26 @@ PAGE = r"""<!doctype html>
   .note { margin: 12px 0 0; color: var(--muted); font-size: 13px; }
   .note b { color: var(--text); font-family: var(--mono); font-weight: 500; }
   .note .warn { color: var(--down); }
+  .lightrow { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
+  .lightrow .rating { margin: 0; }
+  .lamps { display: flex; gap: 6px; padding: 6px 8px; background: #07080a; border: 1px solid var(--line); border-radius: 20px; }
+  .lamp { width: 18px; height: 18px; border-radius: 50%; background: #1a1d22; }
+  .lamp.on.red { background: var(--down); box-shadow: 0 0 14px rgba(246,70,93,.6); }
+  .lamp.on.yellow { background: var(--warn); box-shadow: 0 0 14px rgba(232,184,74,.6); }
+  .lamp.on.green { background: var(--up); box-shadow: 0 0 14px rgba(46,189,133,.6); }
+  .rating.c-red { color: var(--down); } .rating.c-yellow { color: var(--warn); } .rating.c-green { color: var(--up); }
+  .rating.c-off { color: var(--faint); }
+  .filters { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .filters .grp { color: var(--faint); font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; margin-right: 4px; }
+  .filters .grp:not(:first-child) { margin-left: 14px; }
+  .tg { padding: 4px 11px; border-radius: 999px; border: 1px solid #2c323c; background: #1a1e25; color: var(--text);
+        font: 500 12px var(--sans); letter-spacing: 0; cursor: pointer; }
+  .tg:hover:not(:disabled) { background: #222730; border-color: #3a414d; }
+  .tg[aria-pressed="false"] { background: none; border-color: var(--line); color: var(--faint); }
+  .tg[aria-pressed="false"]:hover { background: none; color: var(--muted); border-color: #2c323c; }
+  .tg.all { margin-left: auto; background: none; border-color: transparent; color: var(--muted); }
+  .tg.all:hover { background: none; border-color: transparent; color: var(--text); }
+  [data-f][hidden], [data-fall][hidden] { display: none !important; }
 
   .kv { margin: 0; }
   .kv div { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; padding: 9px 16px; border-bottom: 1px solid var(--line); }
@@ -1169,6 +1310,7 @@ PAGE = r"""<!doctype html>
   /* 3. the evidence */
   .lower { display: grid; gap: 16px; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); align-items: start; }
   @media (max-width: 980px) { .lower { grid-template-columns: 1fr; } }
+  .lower:has(> [hidden]) { grid-template-columns: 1fr; }
   .stack { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
   table.heat { width: 100%; border-collapse: separate; border-spacing: 2px; font-family: var(--mono); font-size: 11px; }
   table.heat th { font-weight: 400; color: var(--faint); padding: 2px 4px; text-align: center; }
@@ -1201,26 +1343,37 @@ PAGE = r"""<!doctype html>
     <div class="clock"><span class="win" id="win"></span><span class="left"><span id="count">--:--</span><small>left</small></span></div>
   </header>
   <div class="alert" id="alert">No fresh data. Is the script still running?</div>
+  <nav class="filters" id="filters" aria-label="Choose what this page shows"></nav>
 
   <div class="hero">
-    <section class="card" aria-live="polite">
+    <section class="card" aria-live="polite" data-f="projection">
       <h2>Projection</h2>
       <div class="pad">
         <div class="dir" id="call">Waiting</div>
         <div class="big" id="pct">--</div>
         <div class="bar" aria-hidden="true"><i id="barfill" style="width:50%"></i></div>
         <div class="barlabels"><span class="up" id="lblup">&#9650; Up</span><span class="down" id="lbldown">Down &#9660;</span></div>
+        <p class="note" id="algo"></p>
       </div>
     </section>
-    <section class="card">
+    <section class="card" data-fall="rating,light">
       <h2>Confidence</h2>
       <div class="pad">
+        <div data-f="rating">
         <div class="rating" id="rating">&ndash;</div>
         <div class="meter" id="meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
         <p class="note" id="track">Waiting for the first price reading.</p>
+        </div>
+        <div data-f="light">
+        <div class="lightrow">
+          <div class="lamps" role="img" id="lamps" aria-label="Light"><div class="lamp red" id="l_red"></div><div class="lamp yellow" id="l_yellow"></div><div class="lamp green" id="l_green"></div></div>
+          <div class="rating c-off" id="word">Off</div>
+        </div>
+        <p class="note" id="why">Waiting for the light.</p>
+        </div>
       </div>
     </section>
-    <section class="card">
+    <section class="card" data-f="conditions">
       <h2>Conditions</h2>
       <dl class="kv">
         <div><dt>Swing level</dt><dd id="s_swing">&ndash;</dd></div>
@@ -1229,20 +1382,21 @@ PAGE = r"""<!doctype html>
         <div id="tiltrow" hidden><dt>Path adjustment</dt><dd id="s_tilt">&ndash;</dd></div>
         <div id="confrow" hidden><dt>Swing adjustment</dt><dd id="s_conf">&ndash;</dd></div>
         <div id="mktrow" hidden><dt id="mktlbl">Market, Up</dt><dd id="s_mkt">&ndash;</dd></div>
+        <div id="basisrow" hidden><dt>Start price from</dt><dd id="s_basis">&ndash;</dd></div>
       </dl>
     </section>
   </div>
 
-  <section class="card">
+  <section class="card" data-fall="stats,chart">
     <h2>This interval</h2>
-    <div class="stats">
+    <div class="stats" data-f="stats">
       <div><span>Start</span><b id="s_start">&ndash;</b></div>
       <div><span>Now</span><b id="s_now">&ndash;</b><small id="s_chg"></small></div>
       <div><span>Likely finish (9 in 10)</span><b id="s_range">&ndash;</b></div>
       <div><span>Typical 1-min move</span><b id="s_vol">&ndash;</b><small id="s_volp"></small></div>
     </div>
-    <canvas id="chart" role="img" aria-label="Price so far in this 15-minute interval with the projected range to the end"></canvas>
-    <div class="legend">
+    <canvas id="chart" data-f="chart" role="img" aria-label="Price so far in this 15-minute interval with the projected range to the end"></canvas>
+    <div class="legend" data-f="chart">
       <span><i class="k"></i>Price</span>
       <span><i class="k start"></i>Start</span>
       <span><i class="k cone"></i>Likely range (50% / 90%)</span>
@@ -1250,8 +1404,8 @@ PAGE = r"""<!doctype html>
     </div>
   </section>
 
-  <div class="lower">
-    <section class="card">
+  <div class="lower" data-fall="record,model,history">
+    <section class="card" data-f="record">
       <h2>Track record</h2>
       <div class="pad">
         <div class="key">
@@ -1268,12 +1422,12 @@ PAGE = r"""<!doctype html>
         <div class="chips" id="cross"><span class="chip">&ndash;</span></div>
       </div>
     </section>
-    <div class="stack">
-      <section class="card">
+    <div class="stack" data-fall="model,history">
+      <section class="card" data-f="model">
         <h2>Model <button id="retrain" type="button">Retrain now</button></h2>
         <dl class="kv" id="tune"><div><dt>Status</dt><dd>Not tuned yet</dd></div></dl>
       </section>
-      <section class="card">
+      <section class="card" data-f="history">
         <h2>History</h2>
         <div class="pad">
           <div class="sub">Recent intervals</div>
@@ -1284,7 +1438,7 @@ PAGE = r"""<!doctype html>
       </section>
     </div>
   </div>
-  <footer>Confidence and the track record are measured on recent days the model was not tuned on. The cone shows where the price is likely to be until the interval ends; example paths show that amount of movement and are not predictions. Not financial advice.</footer>
+  <footer>Confidence and the track record are measured on recent days the model was not tuned on. The light says how far to trust the call, not which way the price will go. The cone shows where the price is likely to be until the interval ends (nothing is projected in the first 5 minutes, when too much can still change); example paths show that amount of movement and are not predictions. Not financial advice.</footer>
 </div>
 
 <script>
@@ -1294,7 +1448,33 @@ const C = n => CSS.getPropertyValue(n).trim();
 const UP = C('--up'), DN = C('--down'), PAPER = C('--text'), MUTED = C('--muted'), GRID = C('--grid'), RULE = C('--line'), HEAT = C('--heat');
 const MONO = '11px ' + C('--mono');
 const NPATH = 10;
+const WARMUP = 300;                     // seconds into an interval before a projection or confidence is shown
 const BUCKETS = ['50–60%', '60–70%', '70–80%', '80–90%', '90%+'], MIDS = [0.55, 0.65, 0.75, 0.85, 0.95];
+// What the page shows. Every part can be switched off; the choice is remembered in this browser.
+const FILTERS = [
+  ['Sections', [['projection', 'Projection'], ['rating', 'Confidence rating'], ['light', 'Light'], ['conditions', 'Conditions'],
+                ['stats', 'Interval numbers'], ['chart', 'Chart'], ['record', 'Track record'], ['model', 'Model'], ['history', 'History']]],
+  ['Chart', [['c_price', 'Price'], ['c_start', 'Start'], ['c_cone', 'Likely range'], ['c_paths', 'Example paths'], ['c_grid', 'Grid']]],
+];
+const F = {}; FILTERS.forEach(([, items]) => items.forEach(([k]) => F[k] = true));
+try { const saved = JSON.parse(localStorage.getItem('main_filters') || '{}'); for (const k in F) if (saved[k] === false) F[k] = false; } catch (e) { /* storage blocked: everything shows */ }
+function applyFilters() {
+  const bar = $('filters'); bar.textContent = '';
+  FILTERS.forEach(([name, items], i) => {
+    bar.append(el('span', 'grp', name));
+    for (const [k, label] of items) { const b = el('button', 'tg', label); b.type = 'button'; b.dataset.k = k; b.setAttribute('aria-pressed', String(F[k])); bar.append(b); }
+  });
+  if (!Object.values(F).every(Boolean)) { const b = el('button', 'tg all', 'Show all'); b.type = 'button'; b.dataset.k = '*'; bar.append(b); }
+  for (const e of document.querySelectorAll('[data-f]')) e.hidden = !F[e.dataset.f];
+  for (const e of document.querySelectorAll('[data-fall]')) e.hidden = e.dataset.fall.split(',').every(k => !F[k]);
+}
+$('filters').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.k === '*') for (const k in F) F[k] = true; else F[b.dataset.k] = !F[b.dataset.k];
+  try { localStorage.setItem('main_filters', JSON.stringify(F)); } catch (e) { /* not remembered, still works */ }
+  applyFilters(); update();
+});
+let LT = null, TS = null;               // the traffic light (btc_light.py) and the test model (btc_lab.py), while they run
 let D = null, lastOk = 0, yr = null, W = null, wKey = null, asked = 0, heatKey = null;
 
 const money = (p, d = 2) => p.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -1333,7 +1513,7 @@ function state() {
   const p = left > 0 ? phi((z + mu) / spread) : (P > S ? 1 : 0);
   const pNoTilt = left > 0 ? phi(z / spread) : p;
   const pNoSwing = left > 0 ? phi((z + mu * kk / kBase) / (spread * kk / kBase)) : p;
-  return { now, left, P, S, sg, spread, mu, p, pNoTilt, pNoSwing };
+  return { now, left, P, S, sg, spread, mu, p, pNoTilt, pNoSwing, early: now - D.start < WARMUP };
 }
 
 function kv(box, rows) {
@@ -1391,30 +1571,72 @@ function model() {
   kv($('tune'), rows);
 }
 
+// The test model (btc_lab.py) is this model plus the signals that passed the lab's backtest: it
+// scales the confidence multiplier and adds to the lean. Its latest adjustment is applied to each
+// fresh reading; without the lab the page shows this script's own model.
+function applyTest() {
+  if (!D || D.test) return;              // the lab's own copy of this page is already the test model
+  const T = TS && TS.d, ok = T && T.test && T.test.active && T.live_k_now && D.k_now && T.start === D.start && Date.now() - TS.at < 20000;
+  if (ok) {
+    const scale = T.k_now / T.live_k_now, lean = T.tilt - (T.live_tilt || 0) * scale;
+    D.k_now *= scale; D.tilt = (D.tilt || 0) * scale + lean;
+  }
+  D.algo = ok ? 'test' : T && T.test && Date.now() - TS.at < 20000 ? 'same' : 'live';
+}
+
+const LIGHT_WORD = { red: 'Red', yellow: 'Yellow', green: 'Green', wait: 'Waiting' };
+function light() {
+  const N = LT && LT.d && LT.d.now, st = D && D.start;
+  const on = N && N.color && Date.now() - LT.at < 20000 && (N.start == null || N.start === st);
+  const color = on ? N.color : null, why = $('why');
+  for (const c of ['red', 'yellow', 'green']) $('l_' + c).classList.toggle('on', color === c);
+  $('lamps').setAttribute('aria-label', 'Light: ' + (color ? LIGHT_WORD[color] : 'off'));
+  $('word').textContent = color ? LIGHT_WORD[color] : 'Off'; $('word').className = 'rating c-' + (color || 'off');
+  why.textContent = '';
+  if (!on) { why.append('The light is off: btc_light.py is not running.'); return; }
+  why.append(el('b', null, 'Light: '), N.reason + (color === 'wait' && N.wait ? `. Calls start in ${mmss(N.wait)}.` : '.'));
+  const g = LT.d.board && LT.d.board.colors && LT.d.board.colors.green, V = LT.d.version;
+  if (g && g.n) why.append(' Green has been right ', el('b', null, Math.round(g.right * 100) + '%'), ` of the time over ${g.blocks} intervals.`);
+  else if (V && V.hold && V.hold.green) why.append(' On unseen history, green was right ', el('b', null, Math.round(V.hold.green.right * 100) + '%'), ' of the time.');
+}
+
 function update() {
   $('root').classList.toggle('stale', Date.now() - lastOk > 8000);
+  light();
+  $('algo').textContent = !D ? '' : D.test || D.algo === 'test' ? 'Test model: this script’s model plus the lab’s proven signals.'
+    : D.algo === 'same' ? 'Test model: no lab signal is active, so it equals this script’s model.'
+    : 'This script’s own model (the lab, btc_lab.py, is not running).';
   model();
   if (D && D.recording) { const sc = $('sources'); sc.textContent = '';
     for (const [k, v] of Object.entries(D.recording)) sc.append(el('span', 'chip ' + (v ? 'on' : 'off'), k + (v ? ' ✓' : ' ✗'))); }
   const st = state();
   if (!st) { if (D && D.error) $('track').textContent = 'Waiting for data: ' + D.error; return; }
-  const { left, P, S, sg, spread, mu, p, pNoTilt, pNoSwing } = st, up = p >= 0.5, conf = up ? p : 1 - p, Lr = D.learn;
+  const { left, P, S, sg, spread, mu, p, pNoTilt, pNoSwing, early } = st, up = p >= 0.5, conf = up ? p : 1 - p, Lr = D.learn;
 
   // header + projection
   $('status').textContent = D.source || '';
   $('win').textContent = `${clock(D.start)} – ${clock(D.end)}`;
   $('count').textContent = mmss(left);
-  const call = $('call'); call.textContent = conf < 0.55 ? (up ? '▲ Leaning up' : '▼ Leaning down') : (up ? '▲ Up' : '▼ Down'); call.className = 'dir ' + (up ? 'up' : 'down');
-  const pc = $('pct'); pc.textContent = Math.round(conf * 100); pc.append(el('sup', null, '%')); pc.className = 'big ' + (up ? 'up' : 'down');
-  $('barfill').style.width = (p * 100).toFixed(1) + '%';
-  $('lblup').textContent = '▲ Up ' + Math.round(p * 100) + '%';
-  $('lbldown').textContent = 'Down ' + Math.round((1 - p) * 100) + '% ▼';
+  const call = $('call'), pc = $('pct');
+  if (early) {                           // too much can still change: no call, no percentage
+    call.textContent = 'Too early to call'; call.className = 'dir';
+    pc.textContent = '--'; pc.className = 'big';
+    $('barfill').style.width = '50%'; $('lblup').textContent = '▲ Up'; $('lbldown').textContent = 'Down ▼';
+  } else {
+    call.textContent = conf < 0.55 ? (up ? '▲ Leaning up' : '▼ Leaning down') : (up ? '▲ Up' : '▼ Down'); call.className = 'dir ' + (up ? 'up' : 'down');
+    pc.textContent = Math.round(conf * 100); pc.append(el('sup', null, '%')); pc.className = 'big ' + (up ? 'up' : 'down');
+    $('barfill').style.width = (p * 100).toFixed(1) + '%';
+    $('lblup').textContent = '▲ Up ' + Math.round(p * 100) + '%';
+    $('lbldown').textContent = 'Down ' + Math.round((1 - p) * 100) + '% ▼';
+  }
 
   // confidence: how readings like this one (same minute, same stated %, same swing level) actually turned out
   const tr = $('track'); tr.textContent = '';
   const m = Math.max(1, Math.min(14, Math.floor((900 - left) / 60))), bk = Math.min(Math.floor((conf - 0.5) * 10), 4), sk = swingKey(D.swing);
   let name = 'Not measured yet', bars = 0;
-  if (Lr && Lr.grid && Lr.grid[m]) {
+  if (early) {
+    name = 'Too early'; tr.append('The first 5 minutes of an interval can still change too much. The projection starts in ', el('b', null, mmss(WARMUP - (900 - left))), '.');
+  } else if (Lr && Lr.grid && Lr.grid[m]) {
     const [hit, n] = Lr.grid[m][bk], steady = (h, c) => (h + 20 * MIDS[bk]) / (c + 20);   // leans on the stated % when cases are few
     const sw = Lr.swing && sk && Lr.swing[sk] ? Lr.swing[sk][bk] : null, swOk = sw && sw[1] >= 30;
     const r = Math.min(steady(hit, n), swOk ? steady(sw[0], sw[1]) : 1);
@@ -1429,7 +1651,7 @@ function update() {
   } else tr.append('Press Retrain now to measure how readings like this have turned out.');
   $('rating').textContent = name;
   [...$('meter').children].forEach((e, i) => e.classList.toggle('on', i < bars));
-  heat(Lr, m, bk);
+  heat(Lr, m, early ? -1 : bk);
 
   // conditions
   const gap = P - S, swing = P * spread;
@@ -1440,8 +1662,8 @@ function update() {
   const beta = (Lr && Lr.beta) || {}, hasTilt = ['momentum', 'steady', 'crossings', 'giveback', 'trend', 'streak'].some(k => k in beta),
         hasSwing = ['burst', 'chop', 'range', 'swing75'].some(k => k in beta);
   const adj = (d) => Math.abs(d) < 0.05 ? 'none right now' : `${Math.abs(d).toFixed(1)} pts toward ${d > 0 ? 'Up' : 'Down'}`;
-  $('tiltrow').hidden = !hasTilt; if (hasTilt) $('s_tilt').textContent = adj((p - pNoTilt) * 100);
-  $('confrow').hidden = !hasSwing;
+  $('tiltrow').hidden = !hasTilt || early; if (hasTilt) $('s_tilt').textContent = adj((p - pNoTilt) * 100);
+  $('confrow').hidden = !hasSwing || early;
   if (hasSwing) { const d = (conf - Math.max(pNoSwing, 1 - pNoSwing)) * 100; $('s_conf').textContent = Math.abs(d) < 0.05 ? 'none right now' : `${d > 0 ? '+' : '−'}${Math.abs(d).toFixed(1)} pts confidence`; }
   const mk = D.market, mkOn = mk && mk.start === D.start && (mk.bid != null || mk.ask != null);
   $('mktrow').hidden = !mkOn;
@@ -1453,14 +1675,17 @@ function update() {
 
   // chart stats
   $('s_start').textContent = (D.exact ? '' : '~') + money(S);
+  $('basisrow').hidden = !D.start_source;
+  if (D.start_source) { const b = D.basis || 0, sb = $('s_basis'); sb.textContent = (D.start_source === 'contract' ? 'Robinhood contract target ' : 'our estimate of the target ');
+    sb.append(el('small', null, Math.abs(b) < 0.005 ? 'price not shifted' : `price shifted ${b > 0 ? '+' : '−'}$${money(Math.abs(b))} to track its index`)); }
   $('s_now').textContent = money(P); $('s_chg').textContent = `${gap >= 0 ? '+' : ''}${(100 * (P / S - 1)).toFixed(3)}%`;
-  $('s_range').textContent = `${money(P * Math.exp(mu - 1.645 * spread), 0)} – ${money(P * Math.exp(mu + 1.645 * spread), 0)}`;
+  $('s_range').textContent = early ? '–' : `${money(P * Math.exp(mu - 1.645 * spread), 0)} – ${money(P * Math.exp(mu + 1.645 * spread), 0)}`;
   $('s_vol').textContent = `±$${money(P * sg, 0)}`; $('s_volp').textContent = `${(sg * 100).toFixed(3)}%`;
 
   const rc = $('recent'); rc.textContent = '';
   for (const r of (D.results || [])) rc.append(el('span', 'chip ' + r.result, clock(r.start) + ' ' + (r.result === 'UP' ? '▲' : r.result === 'DOWN' ? '▼' : '–')));
   if (!rc.childNodes.length) rc.append(el('span', 'chip', 'none yet'));
-  draw(st);
+  if (F.chart) draw(st);
 }
 
 function draw(st) {
@@ -1484,24 +1709,29 @@ function draw(st) {
   const raw = (yr.hi - yr.lo) / 6, mag = Math.pow(10, Math.floor(Math.log10(raw))), step = [1, 2, 5, 10].map(m => m * mag).find(v => v >= raw);
   g.strokeStyle = GRID; g.fillStyle = MUTED; g.textAlign = 'left';
   for (let v = Math.ceil(yr.lo / step) * step; v < yr.hi; v += step) {
-    const y = Math.round(Y(v)) + 0.5; g.beginPath(); g.moveTo(L, y); g.lineTo(L + pw, y); g.stroke();
+    const y = Math.round(Y(v)) + 0.5; if (F.c_grid) { g.beginPath(); g.moveTo(L, y); g.lineTo(L + pw, y); g.stroke(); }
     if (Math.abs(y - yS) > 12 && Math.abs(y - Y(P)) > 12) g.fillText(money(v, step < 1 ? 2 : 0), L + pw + 10, y);
   }
   g.textBaseline = 'top';
   for (let m = 0; m <= 15; m += 5) {
     const x = Math.round(X(t0 + m * 60)) + 0.5; g.strokeStyle = m % 15 ? GRID : RULE;
-    g.beginPath(); g.moveTo(x, T); g.lineTo(x, T + ph); g.stroke();
+    if (F.c_grid) { g.beginPath(); g.moveTo(x, T); g.lineTo(x, T + ph); g.stroke(); }
     g.textAlign = m === 0 ? 'left' : m === 15 ? 'right' : 'center'; g.fillText(clock(t0 + m * 60), x, T + ph + 10);
   }
 
+  // No projection in the first 5 minutes: just mark where it begins.
+  if (st.early) {
+    const xw = Math.round(X(t0 + WARMUP)) + 0.5;
+    g.fillStyle = MUTED; g.textAlign = 'left'; g.textBaseline = 'middle'; g.fillText('projection starts', xw + 6, T + 8);
+  }
   // Cone: tinted by which side of the start price it is on.
-  if (left > 0) {
+  if (left > 0 && !st.early) {
     const N = 48, cone = z => { g.beginPath();
       for (let i = 0; i <= N; i++) { const s = left * i / N; g.lineTo(X(now + s), Y(band(z, s))); }
       for (let i = N; i >= 0; i--) { const s = left * i / N; g.lineTo(X(now + s), Y(band(-z, s))); }
       g.closePath(); g.fill(); };
     for (const [color, y0, y1] of [[UP, T, yS], [DN, yS, T + ph]]) {
-      if (y1 <= y0) continue;
+      if (y1 <= y0 || !F.c_cone) continue;
       g.save(); g.beginPath(); g.rect(xN, Math.max(T, y0), L + pw - xN, Math.min(T + ph, y1) - Math.max(T, y0)); g.clip();
       g.fillStyle = rgba(color, 0.12); cone(1.645); g.fillStyle = rgba(color, 0.16); cone(0.674); g.restore();
     }
@@ -1509,7 +1739,7 @@ function draw(st) {
     if (wKey !== t0) { buildPaths(t0); wKey = t0; }
     const sNow = now - t0, sgS = sg / Math.sqrt(60);
     g.save(); g.beginPath(); g.rect(xN, T, L + pw - xN, ph); g.clip(); g.lineWidth = 1;
-    for (const wk of W) {
+    for (const wk of F.c_paths ? W : []) {
       const base = wAt(wk, sNow), end = P * Math.exp(mu + sgS * (wk[180] - base));
       g.strokeStyle = rgba(end > S ? UP : DN, 0.3); g.beginPath(); g.moveTo(xN, Y(P));
       for (let s = Math.ceil(sNow / 5) * 5; s <= 900; s += 5) g.lineTo(X(t0 + s), Y(P * Math.exp(mu * (s - sNow) / left + sgS * (wAt(wk, s) - base))));
@@ -1519,16 +1749,18 @@ function draw(st) {
   }
 
   // Start price line
-  g.setLineDash([5, 5]); g.strokeStyle = MUTED; g.lineWidth = 1;
-  g.beginPath(); g.moveTo(L, Math.round(yS) + 0.5); g.lineTo(L + pw, Math.round(yS) + 0.5); g.stroke(); g.setLineDash([]);
   g.fillStyle = MUTED; g.textAlign = 'left'; g.textBaseline = 'middle';
-  g.fillText('start ' + money(S), L + pw + 10, yS);
+  if (F.c_start) {
+    g.setLineDash([5, 5]); g.strokeStyle = MUTED; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(L, Math.round(yS) + 0.5); g.lineTo(L + pw, Math.round(yS) + 0.5); g.stroke(); g.setLineDash([]);
+    g.fillText('start ' + money(S), L + pw + 10, yS);
+  }
 
   // Price so far
   g.strokeStyle = PAPER; g.lineWidth = 2; g.lineJoin = 'round'; g.beginPath();
   let first = true;
   for (const [t, p] of D.ticks) { if (t < t0 || t > now) continue; first ? g.moveTo(X(t), Y(p)) : g.lineTo(X(t), Y(p)); first = false; }
-  first ? g.moveTo(xN, Y(P)) : g.lineTo(xN, Y(P)); g.stroke();
+  first ? g.moveTo(xN, Y(P)) : g.lineTo(xN, Y(P)); if (F.c_price) g.stroke();
 
   // Now marker and price tag
   g.strokeStyle = rgba(PAPER, 0.22); g.lineWidth = 1; g.beginPath(); g.moveTo(Math.round(xN) + 0.5, T); g.lineTo(Math.round(xN) + 0.5, T + ph); g.stroke();
@@ -1548,12 +1780,23 @@ $('retrain').addEventListener('click', async () => {
 async function poll() {
   try { const r = await fetch('/data', { cache: 'no-store' }); D = await r.json(); if (D.now && Date.now() / 1000 - D.now < 8) lastOk = Date.now(); }
   catch (e) { /* script stopped; the stale banner will show */ }
+  applyTest();
   update();
   setTimeout(poll, D && D.every ? Math.max(250, Math.min(2000, D.every * 1000)) : 1000);
 }
+// The light and the test model come from their own scripts, asked every 2 s (every 15 s while one is not running).
+async function side(url, keep) {
+  let ok = false;
+  try { const r = await fetch(url + '?t=' + Date.now()); if (r.ok) { keep({ d: await r.json(), at: Date.now() }); ok = true; } }
+  catch (e) { /* that script is not running: the page says so */ }
+  setTimeout(side, ok ? 2000 : 15000, url, keep);
+}
 setInterval(update, 250);
 addEventListener('resize', update);
+applyFilters();
 poll();
+side('/testing-2/data', v => { LT = v; });
+if (!location.pathname.startsWith('/testing')) side('/testing/live', v => { TS = v; });
 </script>
 </body>
 </html>

@@ -4,3 +4,4 @@
 *.db-shm
 __pycache__/
 .DS_Store
+*.log
