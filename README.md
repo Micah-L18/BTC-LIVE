@@ -169,7 +169,7 @@ It needs `btc_15.py` running, and shows the testing lab's call beside it when `b
 
 **The light also shows on the main page**, in the Confidence card, while this script is running (it says "Off" when it is not). While `btc_lab.py` is running, the main page's projection is the lab's test model (the main model plus the signals that passed the backtest); otherwise it is the main model. Either way, the readings `btc_15.py` saves and scores are still its own model's, so the lab and the light keep comparing against an unchanged baseline.
 
-The row of buttons under the main page's header switches each part of the page, and each layer of the chart, on or off. The choice is remembered in that browser.
+The main page's chart has the same options as this page's chart: the buttons under it switch each layer on or off (price, start, likely range, example paths, the light's colour, grid, and the order-book layers: orders so far, resting now, size at each price, largest orders, and the range bent by the orders). The order layers and the light's colour need this script running. The choice is remembered in that browser.
 
 | Light | Meaning |
 |---|---|
